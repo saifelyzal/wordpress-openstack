@@ -1,0 +1,196 @@
+ - hosts: localhost
+   tasks:
+   - name: Creating web server instance
+     os_server:
+       auth:
+         auth_url: http://192.168.1.150:5000/v2.0
+         username: username
+         password: passwd
+         project_name: project
+
+       key_name: kvm3_key
+       nics:
+        - net-name: en-net
+       name: web1_server
+       security_groups: prod-rules
+       image: centos7
+       flavor: 7
+     register: web1
+   - name: Creating db server instance
+     os_server:
+       auth:
+         auth_url: http://192.168.1.150:5000/v2.0
+         username: username
+         password: passwd
+         project_name: project
+
+       key_name: kvm3_key
+       nics:
+        - net-name: en-net
+       name: db_server
+       security_groups: prod-rules
+       image: centos7
+       flavor: 7
+     register: db
+
+   - add_host:
+        name: "{{ web1.server.public_v4 }}"
+        groups: web
+        ansible_user: centos
+        ansible_become: true
+   - wait_for:
+      host: "{{ web1.server.public_v4 }}"
+      port: 22
+      search_regex: OpenSSH
+      #timeout: 600
+
+   - add_host:
+        name: "{{ db.server.public_v4 }}"
+        groups: db
+        ansible_host: "{{ db.server.public_v4 }}"
+        ansible_user: centos
+        ansible_become: true
+   - name: Updating variables file
+     shell: "echo 'DB_IP: '{{ db.server.public_v4 }}'' >> ./vars/main.yml"
+ - hosts: web
+   vars_files:
+   - vars/main.yml
+   handlers:
+   - name: Restarting SSH
+     service: name=sshd state=restarted
+   tasks:
+   - name: Install httpd, and php
+     yum: 
+      name: "{{ item }}"
+      state: installed
+     with_items:
+       - httpd
+       - php-common
+       - php-xml
+       - php-cli
+       - php-mbstring
+       - php-gd
+       - php-mysqlnd
+       - php-pdo
+       - unzip
+       - php
+   - name: updating directoryindex within apache config
+     replace:
+      dest: /etc/httpd/conf/httpd.conf
+      regexp: "^DirectoryIndex index.html"
+      replace: "DirectoryIndex index.html index.php"
+      backup: yes
+   - name: starting apache 
+     service:
+      name: httpd
+      state: started
+      enabled: yes
+   - name: downloading wordpress
+     unarchive:
+      src: https://wordpress.org/latest.zip
+      dest: /var/www/
+      copy: no
+   - name: Moving wordpress installation to the DocRoot
+     shell: "mv /var/www/wordpress/* /var/www/html/"
+     ignore_errors: True
+   - name: copying wp-config
+     copy:
+      src: /var/www/html/wp-config-sample.php
+      dest: /var/www/html/wp-config.php
+      remote_src: yes
+   - name: wp-config
+     replace:
+      dest: /var/www/html/wp-config.php
+      regexp: '^(.*)database_name_here(.*)$'
+      replace: "define('DB_NAME', '{{ DB_NAME }}');"
+   - replace:
+      dest: /var/www/html/wp-config.php
+      regexp: '^(.*)username_here(.*)$'
+      replace: "define('DB_USER', '{{ DB_USERNAME }}');"
+   - replace:
+      dest: /var/www/html/wp-config.php
+      regexp: '^(.*)password_here(.*)$'
+      replace: "define('DB_PASSWORD', '{{ DB_PASSWORD }}');"
+   - replace:
+      dest: /var/www/html/wp-config.php
+      regexp: '^(.*)DB_HOST(.*)$'
+      replace: "define('DB_HOST', '{{ DB_IP }}');"
+   - name: Creating sftpusers group
+     group:
+      name: sftpusers
+      state: present
+
+   - name: Creating SFTP USER
+     user:
+      name: '{{ SFTP_USER }}'
+      shell: '/sbin/nologin'
+      group: sftpusers
+      home: /var/www/html/
+   - name: sftp_pwd
+     shell: 'openssl rand -base64 9'
+     delegate_to: localhost
+     register: sftp_pwd
+   - name: setting sftp user password and saving the password under /root/pwd.txt
+     shell: "echo '{{ sftp_pwd.stdout }}' | passwd --stdin '{{ SFTP_USER }}' && echo '{{ sftp_pwd.stdout }}' >> /root/pwd.txt"
+   - name: Setting Wordpress FTP permission
+     file:
+      dest: /var/www/html
+      mode: 0755
+      owner: root
+   - name: Configuring SSH Chroot
+     replace:
+      dest: /etc/ssh/sshd_config
+      regexp: '^Subsystem      sftp    /usr/libexec/openssh/sftp-server'
+      replace: 'Subsystem sftp internal-sftp'
+   - lineinfile:
+      dest: /etc/ssh/sshd_config
+      line: 'Match group sftpusers'
+      insertafter: '^Subsystem'
+   - lineinfile:
+      dest: /etc/ssh/sshd_config
+      line: 'ChrootDirectory %h'
+      insertafter: '^Match group sftpusers'
+   - lineinfile:
+      dest: /etc/ssh/sshd_config
+      line: 'ForceCommand internal-sftp'
+      insertafter: '^ChrootDirectory'
+     notify: Restarting SSH
+   - name: updating the firewall rules
+     firewalld: service=https permanent=true state=enabled immediate=true
+   - firewalld: service=http permanent=true state=enabled immediate=true
+ - hosts: db
+   vars_files:
+   - vars/main.yml
+   tasks:
+   - name: Installing MYSQL Server
+     yum:
+      name: "{{ item }}"
+      state: installed
+     with_items:
+       - MySQL-python
+       - mariadb
+       - mariadb-server
+   - name: starting MYSQL server
+     service:
+      name: mariadb
+      state: started
+      enabled: yes
+   - name: creating wp database
+     mysql_db:
+      name: '{{ DB_NAME }}'
+      state: present
+   - name: creating wp db user
+     mysql_user:
+      name: "{{ DB_USERNAME }}"
+      password: "{{ DB_PASSWORD }}"
+      priv: '"{{ DB_NAME }}".*:ALL'
+      host: "{{ WEB_IP }}"
+   - name: root_pwd
+     shell: 'openssl rand -base64 9'
+     delegate_to: localhost
+     register: root_pwd
+   - name: Setting MYSQL Root Password
+     shell: 'mysqladmin -u root password "{{ root_pwd.stdout }}" && echo "{{ root_pwd.stdout }}" >> /root/.my.cnf' 
+   - name: updating the firewall rules
+     firewalld: zone=trusted interface=eth1 permanent=true state=enabled immediate=true
+   - firewalld: service=mysql permanent=true state=enabled immediate=true
